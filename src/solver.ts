@@ -1918,3 +1918,181 @@ export function planSingleValveObservers(network: Network, query: ObserverQuery)
     pointCount: recommendedPoints.length,
   };
 }
+
+// ============ 复水开阀顺序规划 ============
+
+/** 复水开阀顺序规划参与枚举的登记关闭阀门数量上限 */
+export const MAX_REWATER_CLOSED_VALVES = 8;
+
+/** 复水顺序中的一步：开启一个待开阀门后按现有模型重算的结果。 */
+export interface RewaterStep {
+  /** 步序（从 1 开始） */
+  step: number;
+  /** 本步开启的待开阀门编号 */
+  valve: string;
+  /** 本步开阀后（此前各步已开阀门保持开启）的总获配量 */
+  totalAllocated: number;
+  /** 累计获配 = 基线总获配 + 截至本步的各步总获配之和 */
+  cumulative: number;
+}
+
+export interface RewaterOk {
+  status: 'ok';
+  /** 待开阀门（当前登记为关闭的阀门）总数 */
+  closedValveCount: number;
+  /** 待开阀门编号（升序） */
+  pendingValves: string[];
+  /** 基线（保持登记状态、不开任何待开阀门）的总获配量，与供水能力核验一致 */
+  baselineAllocated: number;
+  /** 基线参与输水的管段总数（无阀管段 + 当前开启的带阀管段；自环不计） */
+  activePipeCount: number;
+  /** 待开清单为空（无需复水）时为 true，此时 steps / finalOrder 为空清单 */
+  noNeed: boolean;
+  /** 最优顺序的各步明细（无需复水时为空清单） */
+  steps: RewaterStep[];
+  /** 最优完整开阀顺序（无需复水时为空清单） */
+  finalOrder: string[];
+  /** 最优顺序下各步总获配量之和（比较目标，不含基线） */
+  stepTotal: number;
+  /** 全部待开阀门开启后的总获配量（与开阀顺序无关） */
+  finalAllocated: number;
+}
+
+export interface RewaterInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type RewaterResult = RewaterOk | RewaterInvalid;
+
+/** 将升序排列的下标数组推进到下一个字典序排列；已是最后一个排列时返回 false。 */
+function nextPermutation(idx: number[]): boolean {
+  let i = idx.length - 2;
+  while (i >= 0 && idx[i] >= idx[i + 1]) i--;
+  if (i < 0) return false;
+  let j = idx.length - 1;
+  while (idx[j] <= idx[i]) j--;
+  [idx[i], idx[j]] = [idx[j], idx[i]];
+  for (let lo = i + 1, hi = idx.length - 1; lo < hi; lo++, hi--) {
+    [idx[lo], idx[hi]] = [idx[hi], idx[lo]];
+  }
+  return true;
+}
+
+/**
+ * 复水开阀顺序规划：沿用供水能力核验的拓扑、供给上限与出口需求，
+ * 以当前登记为关闭的阀门为待开清单（最多 MAX_REWATER_CLOSED_VALVES 个），
+ * 规划「每步仅开启一个待开阀门、其他登记状态保持不变」的完整开阀顺序。
+ *
+ * - 基线与每一步均按现有「无向管段双向共享容量 1」模型重算最大获配：
+ *   无阀管段与当前开启的带阀管段参与输水，已开的待开阀门自对应步骤起加入，
+ *   其余登记状态（含尚未轮到的待开阀门）保持不变；自环不参与输水；
+ * - 枚举待开阀门的全部排列，以「各开阀后总获配量之和最大」（不含基线）为优选目标，
+ *   同分按阀门编号序列字典序取最小——按编号升序做字典序排列枚举，
+ *   首个达到最大值的排列即所求，无需额外比较；
+ * - 待开清单为空时返回 noNeed（无需复水）；超过上限时返回 invalid（无法规划）；
+ * - 纯函数，不修改输入拓扑、登记的阀门状态与数值表。
+ */
+export function planRewaterSequence(network: Network, query: CapacityQuery): RewaterResult {
+  const { valid, errors } = validateCapacityQuery(network, query);
+  if (!valid) return { status: 'invalid', errors };
+  const { supplyCapList, demandList } = valid;
+
+  const pendingValves = network.valvedPipes.filter((v) => !v.open).map((v) => v.id).sort();
+  if (pendingValves.length > MAX_REWATER_CLOSED_VALVES) {
+    return {
+      status: 'invalid',
+      errors: [
+        `当前登记为关闭的阀门有 ${pendingValves.length} 个，超过复水规划上限 ${MAX_REWATER_CLOSED_VALVES} 个，无法规划；` +
+        '请先在输入中将部分阀门标记为开启（"open": true）后再规划。',
+      ],
+    };
+  }
+
+  const baseEdges = collectActiveEdges(network);
+  const baselineAllocated = computeTotalAllocated(network, supplyCapList, demandList, baseEdges, () => 1);
+
+  if (pendingValves.length === 0) {
+    return {
+      status: 'ok',
+      closedValveCount: 0,
+      pendingValves,
+      baselineAllocated,
+      activePipeCount: baseEdges.length,
+      noNeed: true,
+      steps: [],
+      finalOrder: [],
+      stepTotal: 0,
+      finalAllocated: baselineAllocated,
+    };
+  }
+
+  // 待开阀门编号 → 其管段（开启后作为共享容量 1 的无向边加入；自环不参与输水）
+  const edgeByValve = new Map<string, ActiveEdge>();
+  for (const vp of network.valvedPipes) {
+    if (!vp.open && vp.from !== vp.to) {
+      edgeByValve.set(vp.id, { id: vp.id, from: vp.from, to: vp.to });
+    }
+  }
+
+  // 预计算全部 2^n 个「已开待开阀门子集」的总获配量（空子集即基线），
+  // 之后每个排列的各步取值只是查表，避免按排列重复求最大流
+  const n = pendingValves.length;
+  const subsetCount = 1 << n;
+  const subsetAllocated = new Array<number>(subsetCount);
+  for (let mask = 0; mask < subsetCount; mask++) {
+    if (mask === 0) {
+      subsetAllocated[mask] = baselineAllocated;
+      continue;
+    }
+    const edges = [...baseEdges];
+    for (let i = 0; i < n; i++) {
+      if ((mask & (1 << i)) !== 0) {
+        const edge = edgeByValve.get(pendingValves[i]);
+        if (edge) edges.push(edge);
+      }
+    }
+    subsetAllocated[mask] = computeTotalAllocated(network, supplyCapList, demandList, edges, () => 1);
+  }
+
+  // 字典序枚举全部排列：首个达到最大「各步之和」的排列即
+  // 「和最大 → 阀门编号序列字典序最小」的最优顺序
+  let bestPerm: number[] | null = null;
+  let bestTotal = -1;
+  const perm = Array.from({ length: n }, (_, i) => i);
+  do {
+    let mask = 0;
+    let total = 0;
+    for (const i of perm) {
+      mask |= 1 << i;
+      total += subsetAllocated[mask];
+    }
+    if (total > bestTotal) {
+      bestTotal = total;
+      bestPerm = [...perm];
+    }
+  } while (nextPermutation(perm));
+
+  const best = bestPerm!;
+  let mask = 0;
+  let cumulative = baselineAllocated;
+  const steps: RewaterStep[] = best.map((idx, k) => {
+    mask |= 1 << idx;
+    const totalAllocated = subsetAllocated[mask];
+    cumulative += totalAllocated;
+    return { step: k + 1, valve: pendingValves[idx], totalAllocated, cumulative };
+  });
+
+  return {
+    status: 'ok',
+    closedValveCount: n,
+    pendingValves,
+    baselineAllocated,
+    activePipeCount: baseEdges.length,
+    noNeed: false,
+    steps,
+    finalOrder: best.map((i) => pendingValves[i]),
+    stepTotal: bestTotal,
+    finalAllocated: subsetAllocated[subsetCount - 1],
+  };
+}
