@@ -945,5 +945,105 @@ const beforeRisk = JSON.stringify(network);
 solver.scanValveClosureRisk(network, { supplies: ['S1', 'S2'], outlets: ['B', 'C', 'D'], supplyCaps: { S1: 5, S2: 3 }, outletDemands: { B: 2, C: 1, D: 1 } });
 check('扫描不修改输入网络与登记状态', JSON.stringify(network) === beforeRisk);
 
+// ============ 复水开阀顺序规划 ============
+console.log('复水开阀顺序规划：');
+
+const reopen = (net, supplies, outlets, supplyCaps, outletDemands) =>
+  solver.planReopenSequence(net, { supplies, outlets, supplyCaps, outletDemands });
+
+// 测试主网络：唯一已关阀 V09；基线受 V01/V02 入环限制为 2，
+// 开启 V09 后 B 多一条并行管，但总获配仍受入环能力限制为 2
+const ro1 = reopen(network, ['S1', 'S2'], ['B', 'C', 'D'], { S1: 5, S2: 3 }, { B: 2, C: 1, D: 1 });
+check('规划返回 ok', ro1.status === 'ok');
+check('待开阀门 1 个（V09）', ro1.closedValveCount === 1);
+check('基线总获配与核验一致（2）', ro1.baselineAllocated === 2);
+check('基线参与输水管段 10 条（2 无阀 + 8 开启）', ro1.activePipeCount === 10);
+check('最终顺序即 [V09]', ro1.finalOrder.join(',') === 'V09');
+check('开 V09 后总获配仍为 2（入环瓶颈）', ro1.finalAllocated === 2);
+check('步骤明细：第 1 步开 V09、总获配 2、累计 2',
+  ro1.steps.length === 1 && ro1.steps[0].step === 1 && ro1.steps[0].valve === 'V09' &&
+  ro1.steps[0].totalAllocated === 2 && ro1.steps[0].cumulativeAllocated === 2);
+check('目标值（各步总获配之和）为 2', ro1.objective === 2);
+
+console.log('复水规划：顺序敏感——先开有即时收益的阀门：');
+// V2、V3 串联（单独开任一均无收益，全开才通），V4 直通（开了立即 +1）。
+// 最优顺序须先开 V4；[V4,V2,V3] 与 [V4,V3,V2] 同分，字典序取 [V4,V2,V3]。
+const reopenNet = {
+  nodes: ['S', 'M', 'X', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'X', open: false },
+    { id: 'V3', from: 'X', to: 'O', open: false },
+    { id: 'V4', from: 'S', to: 'O', open: false },
+  ],
+};
+const ro2 = reopen(reopenNet, ['S'], ['O'], { S: 5 }, { O: 5 });
+check('返回 ok 且待开 3 个', ro2.status === 'ok' && ro2.closedValveCount === 3);
+check('基线总获配 0（O 不通）', ro2.baselineAllocated === 0);
+check('最终顺序 [V4,V2,V3]（先开直通阀，同分字典序最小）', ro2.finalOrder.join(',') === 'V4,V2,V3');
+check('各步总获配 1,1,2', ro2.steps.map((s) => s.totalAllocated).join(',') === '1,1,2');
+check('累计获配 1,2,4', ro2.steps.map((s) => s.cumulativeAllocated).join(',') === '1,2,4');
+check('目标值 4 = 最后一步累计获配', ro2.objective === 4 && ro2.steps[2].cumulativeAllocated === 4);
+check('全部开完后总获配 2', ro2.finalAllocated === 2);
+
+console.log('复水规划：空清单提示无需复水：');
+const allOpenNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [{ id: 'V1', from: 'S', to: 'O', open: true }],
+};
+const ro3 = reopen(allOpenNet, ['S'], ['O'], { S: 5 }, { O: 5 });
+check('全部阀门开启时返回 empty', ro3.status === 'empty' && ro3.reason.includes('无需复水'));
+const noValveNet2 = { nodes: ['S', 'O'], pipes: [{ id: 'P1', from: 'S', to: 'O' }], valvedPipes: [] };
+check('无阀门网络同样返回 empty', reopen(noValveNet2, ['S'], ['O'], { S: 1 }, { O: 1 }).status === 'empty');
+
+console.log('复水规划：待开阀门数量上限：');
+const nineClosedNet = {
+  nodes: ['a', 'b'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 9 }, (_, i) => ({ id: `V${i}`, from: 'a', to: 'b', open: false })),
+};
+const ro4 = reopen(nineClosedNet, ['a'], ['b'], { a: 9 }, { b: 9 });
+check('9 个待开阀门被拒绝（无法规划）', ro4.status === 'too-many' && ro4.closedValveCount === 9 &&
+  ro4.reason.includes('9') && ro4.reason.includes('8'));
+const eightClosedNet = {
+  nodes: ['a', 'b'],
+  pipes: [],
+  valvedPipes: Array.from({ length: 8 }, (_, i) => ({ id: `V${i}`, from: 'a', to: 'b', open: false })),
+};
+const ro5 = reopen(eightClosedNet, ['a'], ['b'], { a: 3 }, { b: 9 });
+check('恰好 8 个待开阀门可规划', ro5.status === 'ok' && ro5.closedValveCount === 8);
+check('并行 8 管、供给上限 3：每步获配 1,2,3,3,3,3,3,3',
+  ro5.steps.map((s) => s.totalAllocated).join(',') === '1,2,3,3,3,3,3,3');
+check('目标值 21、最终获配 3', ro5.objective === 21 && ro5.finalAllocated === 3);
+check('全部同分时顺序按编号升序', ro5.finalOrder.join(',') === 'V0,V1,V2,V3,V4,V5,V6,V7');
+
+console.log('复水规划：已关自环阀在清单中但不改变获配：');
+const loopNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'O', open: true },
+    { id: 'V9', from: 'S', to: 'S', open: false }, // 已关自环
+  ],
+};
+const ro6 = reopen(loopNet, ['S'], ['O'], { S: 5 }, { O: 5 });
+check('已关自环阀计入待开清单', ro6.status === 'ok' && ro6.closedValveCount === 1 &&
+  ro6.finalOrder.join(',') === 'V9');
+check('开启自环阀不改变总获配（仍为 1）', ro6.baselineAllocated === 1 &&
+  ro6.finalAllocated === 1 && ro6.steps[0].totalAllocated === 1);
+
+console.log('复水规划：校验与纯函数：');
+const roe1 = reopen(network, ['S1'], ['B'], { S1: -1 }, { B: 1 });
+check('负整数上限被拒绝', roe1.status === 'invalid' && roe1.errors.some((e) => e.includes('非负整数')));
+const roe2 = reopen(network, ['NOPE'], ['B'], { NOPE: 1 }, { B: 1 });
+check('供水点不存在时报错', roe2.status === 'invalid');
+const roe3 = reopen(network, ['S1'], [], { S1: 1 }, {});
+check('缺少出口时报错', roe3.status === 'invalid');
+const beforeReopen = JSON.stringify(reopenNet);
+solver.planReopenSequence(reopenNet, { supplies: ['S'], outlets: ['O'], supplyCaps: { S: 5 }, outletDemands: { O: 5 } });
+check('规划不修改输入网络与登记状态', JSON.stringify(reopenNet) === beforeReopen);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

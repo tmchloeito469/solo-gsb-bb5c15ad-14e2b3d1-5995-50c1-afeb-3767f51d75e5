@@ -1918,3 +1918,179 @@ export function planSingleValveObservers(network: Network, query: ObserverQuery)
     pointCount: recommendedPoints.length,
   };
 }
+
+// ============ 复水开阀顺序规划 ============
+
+/** 复水开阀顺序规划：待开（当前登记为关闭）阀门数量上限 */
+export const MAX_REOPEN_VALVES = 8;
+
+/** 复水开阀顺序中的一步。 */
+export interface ReopenStep {
+  /** 步骤序号（从 1 开始） */
+  step: number;
+  /** 本步开启的待开阀门编号 */
+  valve: string;
+  /** 本步开启后按现有共享容量模型重算的总获配量 */
+  totalAllocated: number;
+  /** 截至本步各步总获配量之和（累计获配） */
+  cumulativeAllocated: number;
+}
+
+export interface ReopenOk {
+  status: 'ok';
+  /** 待开阀门数（当前登记为关闭的阀门总数） */
+  closedValveCount: number;
+  /** 基线参与输水的管段总数（无阀管段 + 当前开启的带阀管段；自环不计） */
+  activePipeCount: number;
+  /** 基线总获配量（不开启任何待开阀门，与供水能力核验一致） */
+  baselineAllocated: number;
+  /** 逐步开阀明细（每步开阀编号、该步总获配、累计获配） */
+  steps: ReopenStep[];
+  /** 最终开阀顺序（= 各步开阀编号依次排列） */
+  finalOrder: string[];
+  /** 全部待开阀门开启后的总获配量（= 最后一步总获配） */
+  finalAllocated: number;
+  /** 规划目标值：各步总获配量之和（= 最后一步累计获配） */
+  objective: number;
+}
+
+/** 待开清单为空：无需复水。 */
+export interface ReopenEmpty {
+  status: 'empty';
+  reason: string;
+}
+
+/** 待开阀门超过上限：无法规划。 */
+export interface ReopenTooMany {
+  status: 'too-many';
+  closedValveCount: number;
+  reason: string;
+}
+
+export interface ReopenInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type ReopenResult = ReopenOk | ReopenEmpty | ReopenTooMany | ReopenInvalid;
+
+/**
+ * 复水开阀顺序规划：沿用供水能力核验的拓扑、供给上限与出口需求，
+ * 以当前登记为关闭的阀门为待开清单（最多 MAX_REOPEN_VALVES 个），
+ * 规划一个「每步仅开启一个待开阀门、其余阀门保持登记状态不变」的完整开阀顺序，
+ * 使**各步开阀后总获配量之和**最大；同分按阀门编号序列字典序取最小。
+ *
+ * - 每步的获配量按与 verifyCapacity 完全相同的模型重算：无阀管段与当前开启的
+ *   带阀管段为双向共享容量 1 的无向边，已开待开阀门自其开启步骤起加入，
+ *   其余已关阀与自环不参与；
+ * - 目标值只与各步的「已开待开阀门集合」有关：先预计算全部 2^n 个子集的总获配
+ *   （n 为待开阀门数），再用子集动态规划求最优顺序——
+ *   f(S) = allocated(S) + max_{v∈S} f(S\{v})，同分保留完整序列字典序最小者；
+ * - 待开清单为空时返回 empty（无需复水），超过上限时返回 too-many（无法规划）；
+ * - 纯函数，不修改输入拓扑、登记的阀门状态与数值表。
+ */
+export function planReopenSequence(network: Network, query: CapacityQuery): ReopenResult {
+  const { valid, errors } = validateCapacityQuery(network, query);
+  if (!valid) return { status: 'invalid', errors };
+  const { supplyCapList, demandList } = valid;
+
+  // 待开清单：当前登记为关闭的阀门（编号升序）
+  const closedValves = network.valvedPipes
+    .filter((v) => !v.open)
+    .map((v) => v.id)
+    .sort();
+  if (closedValves.length === 0) {
+    return {
+      status: 'empty',
+      reason: '无需复水：当前没有登记为关闭的阀门，全部阀门均处于开启状态。',
+    };
+  }
+  if (closedValves.length > MAX_REOPEN_VALVES) {
+    return {
+      status: 'too-many',
+      closedValveCount: closedValves.length,
+      reason:
+        `无法规划：当前登记为关闭的阀门有 ${closedValves.length} 个，超过上限 ${MAX_REOPEN_VALVES} 个；` +
+        '请先在输入中将部分阀门标记为开启（"open": true）后再规划。',
+    };
+  }
+
+  const n = closedValves.length;
+  const bitOf = new Map(closedValves.map((id, i) => [id, i]));
+  // 基线参与输水的管段（无阀管段 + 当前开启的带阀管段；自环不计）
+  const baseEdges = collectActiveEdges(network);
+  // 待开阀门对应的管段（自环不参与输水，开启后同样不计入）
+  const edgeByValve = new Map<string, ActiveEdge>();
+  for (const vp of network.valvedPipes) {
+    if (!vp.open && vp.from !== vp.to && bitOf.has(vp.id)) {
+      edgeByValve.set(vp.id, { id: vp.id, from: vp.from, to: vp.to });
+    }
+  }
+
+  // 预计算全部 2^n 个「已开待开阀门子集」下的总获配量（不改动登记状态）
+  const subsetCount = 1 << n;
+  const allocated: number[] = new Array(subsetCount);
+  for (let mask = 0; mask < subsetCount; mask++) {
+    const edges = baseEdges.slice();
+    for (let i = 0; i < n; i++) {
+      if (mask & (1 << i)) {
+        const e = edgeByValve.get(closedValves[i]);
+        if (e) edges.push(e);
+      }
+    }
+    allocated[mask] = computeTotalAllocated(network, supplyCapList, demandList, edges, () => 1);
+  }
+
+  // 子集动态规划：f(S) = 以某顺序开完 S 中全部阀门时「各步总获配之和」的最大值。
+  // 任意顺序的最后一步开完即集合 S，此前是 S\{v} 的某个顺序，故
+  // f(S) = allocated(S) + max_{v∈S} f(S\{v})；同分保留完整开阀序列字典序最小者
+  // （不同候选的前缀集合不同，完整序列的字典序由前缀决定，子问题最优解可直接拼接）。
+  const bestValue: number[] = new Array(subsetCount).fill(0);
+  const bestSeq: string[][] = new Array(subsetCount).fill([]);
+  for (let mask = 1; mask < subsetCount; mask++) {
+    let value = -1;
+    let seq: string[] = [];
+    for (let i = 0; i < n; i++) {
+      if (!(mask & (1 << i))) continue;
+      const prev = mask ^ (1 << i);
+      const candidateValue = bestValue[prev] + allocated[mask];
+      const candidateSeq = [...bestSeq[prev], closedValves[i]];
+      if (
+        candidateValue > value ||
+        (candidateValue === value && compareValveLists(candidateSeq, seq) < 0)
+      ) {
+        value = candidateValue;
+        seq = candidateSeq;
+      }
+    }
+    bestValue[mask] = value;
+    bestSeq[mask] = seq;
+  }
+
+  const fullMask = subsetCount - 1;
+  const finalOrder = bestSeq[fullMask];
+  const steps: ReopenStep[] = [];
+  let mask = 0;
+  let cumulative = 0;
+  finalOrder.forEach((valve, idx) => {
+    mask |= 1 << bitOf.get(valve)!;
+    cumulative += allocated[mask];
+    steps.push({
+      step: idx + 1,
+      valve,
+      totalAllocated: allocated[mask],
+      cumulativeAllocated: cumulative,
+    });
+  });
+
+  return {
+    status: 'ok',
+    closedValveCount: n,
+    activePipeCount: baseEdges.length,
+    baselineAllocated: allocated[0],
+    steps,
+    finalOrder,
+    finalAllocated: allocated[fullMask],
+    objective: bestValue[fullMask],
+  };
+}
